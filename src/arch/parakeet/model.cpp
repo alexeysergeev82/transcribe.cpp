@@ -26,6 +26,7 @@
 #include "transcribe-meta.h"
 #include "transcribe/parakeet.h"
 #include "weights.h"
+#include "transcribe-language-mix.h"
 
 // No backend-specific #includes: ggml's device registry discovers
 // Metal/Vulkan/CUDA/BLAS at runtime.
@@ -169,31 +170,47 @@ int32_t resolve_prompt_id(const ParakeetHParams & hp, const char * language_hint
     return -1;
 }
 
-// Fill a [num_prompts, T_enc, 1, n_batch] buffer with a one-hot at
-// column prompt_id of each utterance, replicated across T_enc (one id
-// per utterance in prompt_ids). Host-side replication keeps the in-graph
-// step a single concat + two matmuls. Returns false if any id is OOR.
-bool fill_prompt_one_hot(std::vector<float> &         out,
-                         int                          num_prompts,
-                         int                          T_enc,
-                         int                          n_batch,
-                         const std::vector<int32_t> & prompt_ids) {
-    const size_t total = static_cast<size_t>(num_prompts) * static_cast<size_t>(T_enc) * static_cast<size_t>(n_batch);
-    out.assign(total, 0.0f);
-    for (int b = 0; b < n_batch; ++b) {
-        const int32_t pid = (b < static_cast<int>(prompt_ids.size())) ? prompt_ids[static_cast<size_t>(b)] :
-                                                                        (prompt_ids.empty() ? -1 : prompt_ids.front());
+// Resolve the language hint to one row of prompt weights [num_prompts].
+// A single locale (or an empty hint) gives a one-hot at its prompt id. A mix
+// ("ru-RU:0.75,en-US:0.25", see transcribe-language-mix.h) gives the weighted
+// row. Returns false when a locale is not in the prompt dictionary, the model
+// has no prompt table, or the mix is malformed.
+bool resolve_prompt_row(const ParakeetHParams & hp,
+                        const char *            language_hint,
+                        int                     num_prompts,
+                        std::vector<float> &    row) {
+    row.assign(static_cast<size_t>(num_prompts), 0.0f);
+    if (!transcribe::is_language_mix(language_hint)) {
+        const int32_t pid = resolve_prompt_id(hp, language_hint);
         if (pid < 0 || pid >= num_prompts) {
             return false;
         }
-        const size_t per_utt = static_cast<size_t>(num_prompts) * static_cast<size_t>(T_enc);
-        const size_t utt_off = static_cast<size_t>(b) * per_utt;
-        for (int t = 0; t < T_enc; ++t) {
-            const size_t row_off = utt_off + static_cast<size_t>(t) * static_cast<size_t>(num_prompts);
-            out[row_off + static_cast<size_t>(pid)] = 1.0f;
+        row[static_cast<size_t>(pid)] = 1.0f;
+        return true;
+    }
+    std::vector<transcribe::LanguageWeight> mix;
+    if (!transcribe::parse_language_mix(language_hint, mix)) {
+        return false;
+    }
+    for (const transcribe::LanguageWeight & part : mix) {
+        const int32_t pid = resolve_prompt_id(hp, part.locale.c_str());
+        if (pid < 0 || pid >= num_prompts) {
+            return false;
         }
+        row[static_cast<size_t>(pid)] += part.weight;
     }
     return true;
+}
+
+// Fill a [num_prompts, T_enc, 1, n_batch] buffer with `row` replicated across
+// T_enc frames of every utterance. Host-side replication keeps the in-graph
+// step a single concat + two matmuls.
+void fill_prompt_rows(std::vector<float> & out, const std::vector<float> & row, int T_enc, int n_batch) {
+    out.clear();
+    out.reserve(row.size() * static_cast<size_t>(T_enc) * static_cast<size_t>(n_batch));
+    for (int i = 0; i < T_enc * n_batch; ++i) {
+        out.insert(out.end(), row.begin(), row.end());
+    }
 }
 
 // Fuse inference-time BatchNorm into scale + bias tensors:
@@ -1149,22 +1166,16 @@ transcribe_status run_one_shot_inner(ParakeetSession *             pc,
         const int     P         = static_cast<int>(eb.prompt_one_hot_in->ne[0]);
         const int     T_oh      = static_cast<int>(eb.prompt_one_hot_in->ne[1]);
         const char *  lang_hint = (params != nullptr) ? params->language : nullptr;
-        const int32_t pid       = resolve_prompt_id(pm->hparams, lang_hint);
-        if (pid < 0) {
+        std::vector<float> prompt_row;
+        if (!resolve_prompt_row(pm->hparams, lang_hint, P, prompt_row)) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                    "parakeet run: language %s%s%s not in prompt "
-                    "dictionary",
+                    "parakeet run: language %s%s%s is not in the prompt "
+                    "dictionary or is not a valid mix",
                     lang_hint ? "\"" : "", lang_hint ? lang_hint : "<null>", lang_hint ? "\"" : "");
             return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
         }
         std::vector<float> one_hot_buf;
-        if (!fill_prompt_one_hot(one_hot_buf, P, T_oh, /*n_batch=*/1, { pid })) {
-            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                    "parakeet run: prompt_id %d out of range "
-                    "[0, %d)",
-                    pid, P);
-            return TRANSCRIBE_ERR_GGUF;
-        }
+        fill_prompt_rows(one_hot_buf, prompt_row, T_oh, /*n_batch=*/1);
         ggml_backend_tensor_set(eb.prompt_one_hot_in, one_hot_buf.data(), 0, one_hot_buf.size() * sizeof(float));
     }
 
@@ -1536,23 +1547,16 @@ static transcribe_status run_batch_encode(ParakeetSession *                     
         const int     P         = static_cast<int>(eb.prompt_one_hot_in->ne[0]);
         const int     T_oh      = static_cast<int>(eb.prompt_one_hot_in->ne[1]);
         const char *  lang_hint = (params != nullptr) ? params->language : nullptr;
-        const int32_t pid       = resolve_prompt_id(pm->hparams, lang_hint);
-        if (pid < 0) {
+        std::vector<float> prompt_row;
+        if (!resolve_prompt_row(pm->hparams, lang_hint, P, prompt_row)) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                    "parakeet run_batch: language %s%s%s not in prompt "
-                    "dictionary",
+                    "parakeet run_batch: language %s%s%s is not in the prompt "
+                    "dictionary or is not a valid mix",
                     lang_hint ? "\"" : "", lang_hint ? lang_hint : "<null>", lang_hint ? "\"" : "");
             return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
         }
-        std::vector<int32_t> pids(static_cast<size_t>(n), pid);
-        std::vector<float>   one_hot_buf;
-        if (!fill_prompt_one_hot(one_hot_buf, P, T_oh, /*n_batch=*/n, pids)) {
-            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                    "parakeet run_batch: prompt_id %d out of range "
-                    "[0, %d)",
-                    pid, P);
-            return TRANSCRIBE_ERR_GGUF;
-        }
+        std::vector<float> one_hot_buf;
+        fill_prompt_rows(one_hot_buf, prompt_row, T_oh, /*n_batch=*/n);
         ggml_backend_tensor_set(eb.prompt_one_hot_in, one_hot_buf.data(), 0, one_hot_buf.size() * sizeof(float));
     }
 
@@ -2104,22 +2108,16 @@ transcribe_status emit_streaming_chunk(ParakeetSession * pc,
         const int     P         = static_cast<int>(eb.prompt_one_hot_in->ne[0]);
         const int     T_oh      = static_cast<int>(eb.prompt_one_hot_in->ne[1]);
         const char *  lang_hint = pc->stream_run_params.language;
-        const int32_t pid       = resolve_prompt_id(pm->hparams, lang_hint);
-        if (pid < 0) {
+        std::vector<float> prompt_row;
+        if (!resolve_prompt_row(pm->hparams, lang_hint, P, prompt_row)) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                    "parakeet stream: language %s%s%s not in prompt "
-                    "dictionary",
+                    "parakeet stream: language %s%s%s is not in the prompt "
+                    "dictionary or is not a valid mix",
                     lang_hint ? "\"" : "", lang_hint ? lang_hint : "<null>", lang_hint ? "\"" : "");
             return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
         }
         std::vector<float> one_hot_buf;
-        if (!fill_prompt_one_hot(one_hot_buf, P, T_oh, /*n_batch=*/1, { pid })) {
-            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                    "parakeet stream: prompt_id %d out of range "
-                    "[0, %d)",
-                    pid, P);
-            return TRANSCRIBE_ERR_GGUF;
-        }
+        fill_prompt_rows(one_hot_buf, prompt_row, T_oh, /*n_batch=*/1);
         ggml_backend_tensor_set(eb.prompt_one_hot_in, one_hot_buf.data(), 0, one_hot_buf.size() * sizeof(float));
     }
 

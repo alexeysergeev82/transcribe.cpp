@@ -30,6 +30,7 @@
 #include "transcribe-session.h"
 #include "transcribe-tokenizer.h"
 #include "transcribe/whisper.h"
+#include "transcribe-language-mix.h"
 
 #if defined(TRANSCRIBE_GGML_BACKEND_DL) && defined(_WIN32)
 #    ifndef WIN32_LEAN_AND_MEAN
@@ -364,15 +365,28 @@ transcribe_status validate_run_params_common(const transcribe_session * session,
     }
     if (params->language != nullptr && session->model->caps.n_languages > 0 &&
         session->model->caps.languages != nullptr) {
-        bool found = false;
-        for (int i = 0; i < session->model->caps.n_languages; ++i) {
-            const char * entry = session->model->caps.languages[i];
-            if (entry != nullptr && std::strcmp(entry, params->language) == 0) {
-                found = true;
-                break;
+        const auto known = [session](const char * locale) {
+            for (int i = 0; i < session->model->caps.n_languages; ++i) {
+                const char * entry = session->model->caps.languages[i];
+                if (entry != nullptr && std::strcmp(entry, locale) == 0) {
+                    return true;
+                }
             }
-        }
-        if (!found) {
+            return false;
+        };
+        // A mix ("ru-RU:0.75,en-US:0.25") is checked locale by locale; the
+        // family decides whether it can take a mix at all.
+        if (transcribe::is_language_mix(params->language)) {
+            std::vector<transcribe::LanguageWeight> mix;
+            if (!transcribe::parse_language_mix(params->language, mix)) {
+                return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
+            }
+            for (const transcribe::LanguageWeight & part : mix) {
+                if (!known(part.locale.c_str())) {
+                    return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
+                }
+            }
+        } else if (!known(params->language)) {
             return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
         }
     }
