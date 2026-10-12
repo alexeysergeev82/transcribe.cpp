@@ -194,6 +194,21 @@ add_test(NAME transcribe_parakeet_chunked_limited_with_rc_mask_unit
     COMMAND transcribe_parakeet_chunked_limited_with_rc_mask_unit)
 
 # -----------------------------------------------------------------------------
+# Language mix ("ru-RU:0.75,en-US:0.25") parser unit test
+# -----------------------------------------------------------------------------
+
+add_executable(transcribe_language_mix_unit
+    language_mix_unit.cpp)
+
+target_include_directories(transcribe_language_mix_unit
+    PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+transcribe_apply_warnings(transcribe_language_mix_unit)
+
+add_test(NAME transcribe_language_mix_unit
+    COMMAND transcribe_language_mix_unit)
+
+# -----------------------------------------------------------------------------
 # Variable-length batch mask and causal subsampling unit test
 # -----------------------------------------------------------------------------
 
